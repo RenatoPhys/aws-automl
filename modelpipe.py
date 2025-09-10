@@ -131,7 +131,7 @@ class ModelPipeline:
     def prepare_features(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, np.ndarray, List[str], List[str]]:
         """
         Minimal feature preparation - just separate features and target.
-        LightGBM will handle categorical features and missing values natively.
+        Filters out datetime columns and lets LightGBM handle categorical features and missing values natively.
         
         Parameters:
         -----------
@@ -142,9 +142,24 @@ class ModelPipeline:
         --------
         tuple of (X_dataframe, y_array, feature_names, categorical_features)
         """
-        # Get feature columns
-        feature_cols = [col for col in df.columns 
-                       if col not in [self.target_column, self.date_column]]
+        # Get all columns excluding target and date partition
+        all_feature_cols = [col for col in df.columns 
+                           if col not in [self.target_column, self.date_column]]
+        
+        # Filter out datetime columns
+        datetime_types = [pl.Datetime, pl.Date, pl.Time, pl.Duration]
+        feature_cols = []
+        excluded_datetime_cols = []
+        
+        for col in all_feature_cols:
+            if df[col].dtype in datetime_types:
+                excluded_datetime_cols.append(col)
+            else:
+                feature_cols.append(col)
+        
+        if excluded_datetime_cols:
+            print(f"  Excluded {len(excluded_datetime_cols)} datetime columns: {', '.join(excluded_datetime_cols[:5])}" + 
+                  (f"... (+{len(excluded_datetime_cols)-5} more)" if len(excluded_datetime_cols) > 5 else ""))
         
         # Select features and target
         X = df.select(feature_cols)
@@ -159,7 +174,7 @@ class ModelPipeline:
             y = y.astype(np.int32)
         
         print(f"  Features: {len(feature_cols)} total, {len(categorical_features)} categorical")
-        print(f"  Missing values per column: {X.null_count().sum(axis=0).to_numpy().sum()} total")
+        print(f"  Missing values total: {X.null_count().sum_horizontal()[0]}")
         
         return X, y, feature_cols, categorical_features
     
