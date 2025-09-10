@@ -169,11 +169,15 @@ class ModelPipeline:
         categorical_features = [col for col in feature_cols 
                               if X[col].dtype == pl.Utf8]
         
+        # Identify Decimal columns (will be converted to Float64 later)
+        decimal_features = [col for col in feature_cols 
+                           if X[col].dtype == pl.Decimal]
+        
         # Ensure target is integer for classification
         if y.dtype not in [np.int32, np.int64]:
             y = y.astype(np.int32)
         
-        print(f"  Features: {len(feature_cols)} total, {len(categorical_features)} categorical")
+        print(f"  Features: {len(feature_cols)} total, {len(categorical_features)} categorical, {len(decimal_features)} decimal")
         print(f"  Missing values total: {X.null_count().sum_horizontal()[0]}")
         
         return X, y, feature_cols, categorical_features
@@ -196,6 +200,18 @@ class ModelPipeline:
         --------
         tuple of (model, metrics_dict, additional_info)
         """
+
+        # Handle Decimal columns - convert to Float64 before pandas conversion
+        decimal_cols = [col for col in X_train.columns if X_train[col].dtype == pl.Decimal]
+        if decimal_cols:
+            print(f"  Converting {len(decimal_cols)} Decimal columns to Float64")
+            X_train = X_train.with_columns([
+                pl.col(col).cast(pl.Float64) for col in decimal_cols
+            ])
+            X_test = X_test.with_columns([
+                pl.col(col).cast(pl.Float64) for col in decimal_cols
+            ])
+
         # Convert Polars DataFrames to pandas for LightGBM
         # LightGBM needs pandas DataFrame to properly handle categorical features
         X_train_pd = X_train.to_pandas()
