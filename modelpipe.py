@@ -3,7 +3,6 @@ import polars as pl
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.preprocessing import LabelEncoder
 import lightgbm as lgb
 import json
 import matplotlib.pyplot as plt
@@ -15,8 +14,8 @@ warnings.filterwarnings('ignore')
 
 class ModelPipeline:
     """
-    A pipeline for training LightGBM classification models on multiple tables from S3 using Polars,
-    evaluating performance, and extracting feature importance.
+    A simplified pipeline for training LightGBM classification models on multiple tables from S3 using Polars,
+    with minimal preprocessing (no encoding, no missing value filling).
     """
     
     def __init__(self, 
@@ -65,7 +64,9 @@ class ModelPipeline:
             'verbose': -1,
             'random_state': 42,
             'n_estimators': 100,
-            'early_stopping_rounds': 10
+            'early_stopping_rounds': 10,
+            'use_missing': True,  # Allow LightGBM to handle missing values
+            'zero_as_missing': False
         }
         
     def read_s3_table(self, s3_path: str) -> pl.DataFrame:
@@ -127,109 +128,70 @@ class ModelPipeline:
         
         return train_df, test_df
     
-    def prepare_features(self, df: pl.DataFrame, 
-                        label_encoders: Optional[Dict] = None,
-                        fit_encoders: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str], Dict]:
+    def prepare_features(self, df: pl.DataFrame) -> Tuple[pl.DataFrame, np.ndarray, List[str], List[str]]:
         """
-        Prepare features and target for modeling with proper encoding for LightGBM.
+        Minimal feature preparation - just separate features and target.
+        LightGBM will handle categorical features and missing values natively.
         
         Parameters:
         -----------
         df : pl.DataFrame
             Input dataframe
-        label_encoders : dict, optional
-            Pre-fitted label encoders for categorical variables
-        fit_encoders : bool
-            Whether to fit new encoders (True for train, False for test)
         
         Returns:
         --------
-        tuple of (X, y, feature_names, label_encoders)
+        tuple of (X_dataframe, y_array, feature_names, categorical_features)
         """
         # Get feature columns
         feature_cols = [col for col in df.columns 
                        if col not in [self.target_column, self.date_column]]
         
-        # Handle categorical variables
-        df_processed = df.select(feature_cols + [self.target_column])
+        # Select features and target
+        X = df.select(feature_cols)
+        y = df[self.target_column].to_numpy()
         
-        # Identify categorical columns
-        categorical_cols = [col for col in feature_cols 
-                          if df_processed[col].dtype == pl.Utf8]
-        
-        # Initialize or use existing label encoders
-        if label_encoders is None:
-            label_encoders = {}
-        
-        # Encode categorical variables with LabelEncoder for LightGBM
-        for col in categorical_cols:
-            if fit_encoders:
-                # Fit new encoder
-                le = LabelEncoder()
-                # Get unique values and handle nulls
-                values = df_processed[col].drop_nulls().to_numpy()
-                le.fit(values)
-                label_encoders[col] = le
-            else:
-                # Use existing encoder
-                le = label_encoders.get(col)
-                if le is None:
-                    print(f"Warning: No encoder found for {col}, creating new one")
-                    le = LabelEncoder()
-                    values = df_processed[col].drop_nulls().to_numpy()
-                    le.fit(values)
-                    label_encoders[col] = le
-            
-            # Transform the column
-            col_values = df_processed[col].to_numpy()
-            # Handle unseen categories
-            col_values = np.where(np.isin(col_values, le.classes_), col_values, 'unknown')
-            if 'unknown' not in le.classes_:
-                le.classes_ = np.append(le.classes_, 'unknown')
-            
-            encoded_values = le.transform(col_values)
-            df_processed = df_processed.with_columns(
-                pl.Series(col, encoded_values).cast(pl.Int32)
-            )
-        
-        # Handle missing values for numeric columns
-        numeric_cols = [col for col in feature_cols 
-                       if df_processed[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
-        
-        for col in numeric_cols:
-            # LightGBM can handle NaN values natively, but we'll fill them for consistency
-            mean_val = df_processed[col].mean()
-            if mean_val is not None:
-                df_processed = df_processed.with_columns(
-                    pl.col(col).fill_null(mean_val)
-                )
-        
-        # Convert to numpy arrays
-        X = df_processed.select(feature_cols).to_numpy()
-        y = df_processed[self.target_column].to_numpy()
+        # Identify categorical columns for LightGBM
+        categorical_features = [col for col in feature_cols 
+                              if X[col].dtype == pl.Utf8]
         
         # Ensure target is integer for classification
         if y.dtype not in [np.int32, np.int64]:
             y = y.astype(np.int32)
         
-        return X, y, feature_cols, label_encoders
+        print(f"  Features: {len(feature_cols)} total, {len(categorical_features)} categorical")
+        print(f"  Missing values per column: {X.null_count().sum(axis=0).to_numpy().sum()} total")
+        
+        return X, y, feature_cols, categorical_features
     
-    def train_lgbm_model(self, X_train: np.ndarray, y_train: np.ndarray,
-                        X_test: np.ndarray, y_test: np.ndarray,
-                        feature_names: List[str]) -> Tuple[lgb.LGBMClassifier, Dict, Dict]:
+    def train_lgbm_model(self, X_train: pl.DataFrame, y_train: np.ndarray,
+                        X_test: pl.DataFrame, y_test: np.ndarray,
+                        feature_names: List[str], 
+                        categorical_features: List[str]) -> Tuple[lgb.LGBMClassifier, Dict, Dict]:
         """
-        Train LightGBM model and evaluate performance.
+        Train LightGBM model with native categorical support and missing value handling.
         
         Parameters:
         -----------
-        X_train, y_train : Training features and target
-        X_test, y_test : Testing features and target
+        X_train, y_train : Training features (as DataFrame) and target
+        X_test, y_test : Testing features (as DataFrame) and target
         feature_names : List of feature names
+        categorical_features : List of categorical feature names
         
         Returns:
         --------
         tuple of (model, metrics_dict, additional_info)
         """
+        # Convert Polars DataFrames to pandas for LightGBM
+        # LightGBM needs pandas DataFrame to properly handle categorical features
+        X_train_pd = X_train.to_pandas()
+        X_test_pd = X_test.to_pandas()
+        
+        # Convert categorical columns to 'category' dtype for LightGBM
+        for cat_col in categorical_features:
+            if cat_col in X_train_pd.columns:
+                X_train_pd[cat_col] = X_train_pd[cat_col].astype('category')
+                X_test_pd[cat_col] = X_test_pd[cat_col].astype('category')
+        
         # Determine number of classes
         n_classes = len(np.unique(y_train))
         
@@ -244,16 +206,17 @@ class ModelPipeline:
         model = lgb.LGBMClassifier(**params)
         
         # Train model with validation set for early stopping
+        # LightGBM will automatically handle categorical features and missing values
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
+            X_train_pd, y_train,
+            eval_set=[(X_test_pd, y_test)],
             eval_metric='logloss' if n_classes == 2 else 'multi_logloss',
             callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
         )
         
         # Make predictions
-        y_pred = model.predict(X_test)
-        y_pred_proba = model.predict_proba(X_test)
+        y_pred = model.predict(X_test_pd)
+        y_pred_proba = model.predict_proba(X_test_pd)
         
         # Calculate metrics
         metrics = {
@@ -278,6 +241,7 @@ class ModelPipeline:
             'n_classes': n_classes,
             'best_iteration': model.best_iteration_,
             'feature_names': feature_names,
+            'categorical_features': categorical_features,
             'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
             'class_distribution_train': dict(zip(*np.unique(y_train, return_counts=True))),
             'class_distribution_test': dict(zip(*np.unique(y_test, return_counts=True)))
@@ -421,6 +385,7 @@ Best Iteration: {additional_info['best_iteration']}
 Train Samples: {sum(train_counts):,}
 Test Samples: {sum(test_counts):,}
 Total Features: {len(additional_info['feature_names'])}
+Categorical Features: {len(additional_info['categorical_features'])}
 
 Top 3 Features:
 1. {features[0] if len(features) > 0 else 'N/A'}
@@ -445,9 +410,10 @@ Top 3 Features:
         all_results = {}
         
         print(f"\n{'='*80}")
-        print(f"LIGHTGBM CLASSIFICATION PIPELINE")
+        print(f"LIGHTGBM CLASSIFICATION PIPELINE (MINIMAL PREPROCESSING)")
         print(f"Train/Test Split Date: {self.train_cutoff_date}")
         print(f"Number of tables to process: {len(self.s3_paths)}")
+        print(f"Preprocessing: None (LightGBM handles categorical & missing values)")
         print(f"{'='*80}")
         
         for i, s3_path in enumerate(self.s3_paths):
@@ -471,20 +437,15 @@ Top 3 Features:
                 train_df, test_df = self.split_by_date(df)
                 print(f"  Train shape: {train_df.shape}, Test shape: {test_df.shape}")
                 
-                # Prepare features
-                print(f"\n🔧 Preparing features...")
-                X_train, y_train, feature_names, label_encoders = self.prepare_features(
-                    train_df, fit_encoders=True
-                )
-                X_test, y_test, _, _ = self.prepare_features(
-                    test_df, label_encoders=label_encoders, fit_encoders=False
-                )
-                print(f"  Feature matrix shape - Train: {X_train.shape}, Test: {X_test.shape}")
+                # Prepare features (minimal processing)
+                print(f"\n🔧 Preparing features (minimal preprocessing)...")
+                X_train, y_train, feature_names, categorical_features = self.prepare_features(train_df)
+                X_test, y_test, _, _ = self.prepare_features(test_df)
                 
                 # Train model and get metrics
                 print(f"\n🚀 Training LightGBM classifier...")
                 model, metrics, additional_info = self.train_lgbm_model(
-                    X_train, y_train, X_test, y_test, feature_names
+                    X_train, y_train, X_test, y_test, feature_names, categorical_features
                 )
                 print(f"  Training completed at iteration {additional_info['best_iteration']}")
                 
@@ -504,8 +465,7 @@ Top 3 Features:
                     'train_samples': train_df.height,
                     'test_samples': test_df.height,
                     'total_features': len(feature_names),
-                    'additional_info': additional_info,
-                    'label_encoders': {k: v.classes_.tolist() for k, v in label_encoders.items()}
+                    'additional_info': additional_info
                 }
                 
                 # Print summary
@@ -598,6 +558,7 @@ Top 3 Features:
                     'train_samples': results['train_samples'],
                     'test_samples': results['test_samples'],
                     'total_features': results['total_features'],
+                    'n_categorical': len(results['additional_info']['categorical_features']),
                     'n_classes': results['additional_info']['n_classes'],
                     'best_iteration': results['additional_info']['best_iteration'],
                     'top_feature_1': results['top_k_features'][0] if len(results['top_k_features']) > 0 else None,
@@ -690,7 +651,9 @@ def main():
         'verbose': -1,
         'random_state': 42,
         'n_estimators': 200,
-        'early_stopping_rounds': 20
+        'early_stopping_rounds': 20,
+        'use_missing': True,  # Let LightGBM handle missing values
+        'zero_as_missing': False
     }
     
     # Initialize pipeline
