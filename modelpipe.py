@@ -183,24 +183,18 @@ class ModelPipeline:
         return X, y, feature_cols, categorical_features
     
     def train_lgbm_model(self, X_train: pl.DataFrame, y_train: np.ndarray,
-                        X_test: pl.DataFrame, y_test: np.ndarray,
-                        feature_names: List[str], 
-                        categorical_features: List[str]) -> Tuple[lgb.LGBMClassifier, Dict, Dict]:
+                    X_test: pl.DataFrame, y_test: np.ndarray,
+                    feature_names: List[str], 
+                    categorical_features: List[str]) -> Tuple[lgb.LGBMClassifier, Dict, Dict, np.ndarray, np.ndarray]:
         """
         Train LightGBM model with native categorical support and missing value handling.
-        
-        Parameters:
-        -----------
-        X_train, y_train : Training features (as DataFrame) and target
-        X_test, y_test : Testing features (as DataFrame) and target
-        feature_names : List of feature names
-        categorical_features : List of categorical feature names
+        Now returns train and test prediction probabilities for KS calculation.
         
         Returns:
         --------
-        tuple of (model, metrics_dict, additional_info)
+        tuple of (model, metrics_dict, additional_info, y_train_pred_proba, y_test_pred_proba)
         """
-
+        
         # Handle Decimal columns - convert to Float64 before pandas conversion
         decimal_cols = [col for col in X_train.columns if X_train[col].dtype == pl.Decimal]
         if decimal_cols:
@@ -213,7 +207,6 @@ class ModelPipeline:
             ])
 
         # Convert Polars DataFrames to pandas for LightGBM
-        # LightGBM needs pandas DataFrame to properly handle categorical features
         X_train_pd = X_train.to_pandas()
         X_test_pd = X_test.to_pandas()
         
@@ -237,7 +230,6 @@ class ModelPipeline:
         model = lgb.LGBMClassifier(**params)
         
         # Train model with validation set for early stopping
-        # LightGBM will automatically handle categorical features and missing values
         model.fit(
             X_train_pd, y_train,
             eval_set=[(X_test_pd, y_test)],
@@ -247,7 +239,10 @@ class ModelPipeline:
         
         # Make predictions
         y_pred = model.predict(X_test_pd)
-        y_pred_proba = model.predict_proba(X_test_pd)
+        y_test_pred_proba = model.predict_proba(X_test_pd)
+        
+        # Get train predictions for overfitting analysis
+        y_train_pred_proba = model.predict_proba(X_train_pd)
         
         # Calculate metrics
         metrics = {
@@ -259,11 +254,11 @@ class ModelPipeline:
         
         # Add ROC AUC for binary classification
         if n_classes == 2:
-            metrics['roc_auc'] = roc_auc_score(y_test, y_pred_proba[:, 1])
+            metrics['roc_auc'] = roc_auc_score(y_test, y_test_pred_proba[:, 1])
         else:
             # Multi-class ROC AUC
             try:
-                metrics['roc_auc'] = roc_auc_score(y_test, y_pred_proba, multi_class='ovr', average='weighted')
+                metrics['roc_auc'] = roc_auc_score(y_test, y_test_pred_proba, multi_class='ovr', average='weighted')
             except:
                 metrics['roc_auc'] = None
         
@@ -278,7 +273,7 @@ class ModelPipeline:
             'class_distribution_test': dict(zip(*np.unique(y_test, return_counts=True)))
         }
         
-        return model, metrics, additional_info
+        return model, metrics, additional_info, y_train_pred_proba, y_test_pred_proba
     
     def get_feature_importance(self, model: lgb.LGBMClassifier, 
                               feature_names: List[str],
@@ -314,10 +309,36 @@ class ModelPipeline:
         
         return feature_importance
     
-    def plot_diagnostics(self, table_name: str, metrics: Dict, 
-                        feature_importance: Dict, additional_info: Dict) -> None:
+    def calculate_ks_statistic(y_true, y_pred_proba):
         """
-        Create comprehensive diagnostic plots for a table.
+        Calculate Kolmogorov-Smirnov statistic for binary classification.
+        
+        Parameters:
+        -----------
+        y_true : array-like
+            True binary labels
+        y_pred_proba : array-like
+            Predicted probabilities for positive class
+        
+        Returns:
+        --------
+        float : KS statistic
+        """
+        # Get predictions for each class
+        preds_class0 = y_pred_proba[y_true == 0]
+        preds_class1 = y_pred_proba[y_true == 1]
+        
+        # Calculate KS statistic
+        ks_statistic = stats.ks_2samp(preds_class0, preds_class1).statistic
+        
+        return ks_statistic
+
+    def plot_diagnostics(self, table_name: str, metrics: Dict, 
+                        feature_importance: Dict, additional_info: Dict,
+                        y_train: np.ndarray, y_test: np.ndarray,
+                        y_train_pred_proba: np.ndarray, y_test_pred_proba: np.ndarray) -> None:
+        """
+        Create simplified diagnostic plots for a table.
         
         Parameters:
         -----------
@@ -329,62 +350,47 @@ class ModelPipeline:
             Feature importance scores
         additional_info : dict
             Additional model information
+        y_train : np.ndarray
+            Training target values
+        y_test : np.ndarray
+            Test target values
+        y_train_pred_proba : np.ndarray
+            Training predictions probabilities
+        y_test_pred_proba : np.ndarray
+            Test predictions probabilities
         """
-        fig = plt.figure(figsize=(20, 10))
+        fig = plt.figure(figsize=(18, 8))
         
-        # Create grid
-        gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+        # Create grid - 2x2 layout
+        gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3, 
+                            height_ratios=[1.2, 0.8])
         
-        # Plot 1: Performance Metrics
-        ax1 = fig.add_subplot(gs[0, 0])
-        metric_names = list(metrics.keys())
-        metric_values = list(metrics.values())
-        
-        bars = ax1.bar(metric_names, metric_values, color='steelblue')
-        ax1.set_title(f'Model Performance - {table_name}', fontsize=12, fontweight='bold')
-        ax1.set_xlabel('Metrics')
-        ax1.set_ylabel('Score')
-        ax1.set_ylim([0, 1.1])
-        
-        # Add value labels on bars
-        for bar, value in zip(bars, metric_values):
-            if value is not None:
-                height = bar.get_height()
-                ax1.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{value:.3f}', ha='center', va='bottom')
-        
-        # Plot 2: Top K Feature Importance
-        ax2 = fig.add_subplot(gs[0, 1:])
+        # Plot 1: Top K Feature Importance (larger plot)
+        ax1 = fig.add_subplot(gs[0, :])
         top_features = dict(list(feature_importance.items())[:self.top_k_features])
         
         features = list(top_features.keys())
         importances = list(top_features.values())
         
+        # Create horizontal bar plot
         y_pos = np.arange(len(features))
-        bars = ax2.barh(y_pos, importances, color='coral')
-        ax2.set_yticks(y_pos)
-        ax2.set_yticklabels(features, fontsize=9)
-        ax2.set_xlabel('Normalized Importance Score')
-        ax2.set_title(f'Top {self.top_k_features} Important Features - {table_name}', 
-                     fontsize=12, fontweight='bold')
-        ax2.invert_yaxis()
+        bars = ax1.barh(y_pos, importances, color='steelblue', edgecolor='navy', alpha=0.8)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(features, fontsize=10)
+        ax1.set_xlabel('Normalized Importance Score', fontsize=11)
+        ax1.set_title(f'Top {self.top_k_features} Important Features - {table_name}', 
+                    fontsize=13, fontweight='bold', pad=15)
+        ax1.invert_yaxis()
+        ax1.grid(axis='x', alpha=0.3, linestyle='--')
         
         # Add value labels
         for bar, value in zip(bars, importances):
             width = bar.get_width()
-            ax2.text(width, bar.get_y() + bar.get_height()/2.,
-                    f'{value:.3f}', ha='left', va='center', fontsize=8)
+            ax1.text(width + 0.005, bar.get_y() + bar.get_height()/2.,
+                    f'{value:.3f}', ha='left', va='center', fontsize=9, fontweight='bold')
         
-        # Plot 3: Confusion Matrix
-        ax3 = fig.add_subplot(gs[1, 0])
-        cm = np.array(additional_info['confusion_matrix'])
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax3)
-        ax3.set_title(f'Confusion Matrix - {table_name}', fontsize=12, fontweight='bold')
-        ax3.set_xlabel('Predicted')
-        ax3.set_ylabel('Actual')
-        
-        # Plot 4: Class Distribution
-        ax4 = fig.add_subplot(gs[1, 1])
+        # Plot 2: Class Distribution
+        ax2 = fig.add_subplot(gs[1, 0])
         train_dist = additional_info['class_distribution_train']
         test_dist = additional_info['class_distribution_test']
         
@@ -395,38 +401,119 @@ class ModelPipeline:
         x = np.arange(len(classes))
         width = 0.35
         
-        ax4.bar(x - width/2, train_counts, width, label='Train', color='skyblue')
-        ax4.bar(x + width/2, test_counts, width, label='Test', color='lightcoral')
+        bars1 = ax2.bar(x - width/2, train_counts, width, label='Train', 
+                    color='skyblue', edgecolor='navy', alpha=0.8)
+        bars2 = ax2.bar(x + width/2, test_counts, width, label='Test', 
+                    color='lightcoral', edgecolor='darkred', alpha=0.8)
         
-        ax4.set_xlabel('Class')
-        ax4.set_ylabel('Count')
-        ax4.set_title(f'Class Distribution - {table_name}', fontsize=12, fontweight='bold')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(classes)
-        ax4.legend()
+        # Add value labels on bars
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{int(height):,}', ha='center', va='bottom', fontsize=9)
         
-        # Plot 5: Model Info
-        ax5 = fig.add_subplot(gs[1, 2])
-        ax5.axis('off')
+        ax2.set_xlabel('Class', fontsize=11)
+        ax2.set_ylabel('Count', fontsize=11)
+        ax2.set_title(f'Class Distribution - {table_name}', fontsize=12, fontweight='bold')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(classes)
+        ax2.legend(loc='upper right')
+        ax2.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # Plot 3: ROC AUC & KS Metrics
+        ax3 = fig.add_subplot(gs[1, 1])
+        ax3.axis('off')
+        
+        # Calculate metrics for binary classification
+        metrics_text = f"""Performance Metrics - {table_name}
+        
+    {'='*40}"""
+        
+        n_classes = additional_info['n_classes']
+        
+        if n_classes == 2:
+            # Binary classification - calculate ROC AUC and KS
+            try:
+                # ROC AUC for train and test
+                train_roc_auc = roc_auc_score(y_train, y_train_pred_proba[:, 1])
+                test_roc_auc = roc_auc_score(y_test, y_test_pred_proba[:, 1])
+                
+                # KS Statistic for train and test
+                train_ks = calculate_ks_statistic(y_train, y_train_pred_proba[:, 1])
+                test_ks = calculate_ks_statistic(y_test, y_test_pred_proba[:, 1])
+                
+                metrics_text += f"""
+    TRAIN METRICS:
+    ROC AUC: {train_roc_auc:.4f}
+    KS Statistic: {train_ks:.4f}
+    
+    TEST METRICS:
+    ROC AUC: {test_roc_auc:.4f}
+    KS Statistic: {test_ks:.4f}
+    
+    OVERFITTING CHECK:
+    ROC AUC Diff: {abs(train_roc_auc - test_roc_auc):.4f}
+    KS Diff: {abs(train_ks - test_ks):.4f}"""
+                
+            except Exception as e:
+                metrics_text += f"\nError calculating metrics: {str(e)}"
+        else:
+            # Multi-class classification
+            try:
+                train_roc_auc = roc_auc_score(y_train, y_train_pred_proba, 
+                                            multi_class='ovr', average='weighted')
+                test_roc_auc = roc_auc_score(y_test, y_test_pred_proba, 
+                                            multi_class='ovr', average='weighted')
+                
+                metrics_text += f"""
+    TRAIN METRICS:
+    ROC AUC (weighted): {train_roc_auc:.4f}
+    
+    TEST METRICS:
+    ROC AUC (weighted): {test_roc_auc:.4f}
+    
+    OVERFITTING CHECK:
+    ROC AUC Diff: {abs(train_roc_auc - test_roc_auc):.4f}
+    
+    Note: KS statistic not applicable for 
+    multi-class classification"""
+                
+            except Exception as e:
+                metrics_text += f"\nError calculating metrics: {str(e)}"
+        
+        metrics_text += f"""
+    {'='*40}
+
+    BASIC METRICS:
+    Accuracy: {metrics['accuracy']:.4f}
+    F1 Score: {metrics['f1']:.4f}
+    Precision: {metrics['precision']:.4f}
+    Recall: {metrics['recall']:.4f}"""
+        
+        ax3.text(0.05, 0.95, metrics_text, transform=ax3.transAxes, 
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.2))
+        
+        # Add Model Information in the bottom right corner
         info_text = f"""Model Information
         
-Dataset: {table_name}
-Number of Classes: {additional_info['n_classes']}
-Best Iteration: {additional_info['best_iteration']}
-Train Samples: {sum(train_counts):,}
-Test Samples: {sum(test_counts):,}
-Total Features: {len(additional_info['feature_names'])}
-Categorical Features: {len(additional_info['categorical_features'])}
-
-Top 3 Features:
-1. {features[0] if len(features) > 0 else 'N/A'}
-2. {features[1] if len(features) > 1 else 'N/A'}
-3. {features[2] if len(features) > 2 else 'N/A'}
-"""
-        ax5.text(0.1, 0.9, info_text, transform=ax5.transAxes, 
-                fontsize=10, verticalalignment='top', fontfamily='monospace')
+    Dataset: {table_name}
+    Number of Classes: {additional_info['n_classes']}
+    Best Iteration: {additional_info['best_iteration']}
+    Train Samples: {sum(train_counts):,}
+    Test Samples: {sum(test_counts):,}
+    Total Features: {len(additional_info['feature_names'])}
+    Categorical Features: {len(additional_info['categorical_features'])}"""
         
-        plt.suptitle(f'Diagnostic Report - {table_name}', fontsize=14, fontweight='bold', y=1.02)
+        # Create text box for model info
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.3)
+        fig.text(0.98, 0.02, info_text, transform=fig.transFigure, 
+                fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+                fontfamily='monospace', bbox=props)
+        
+        plt.suptitle(f'Model Diagnostic Report - {table_name}', 
+                    fontsize=14, fontweight='bold', y=0.98)
         plt.tight_layout()
         plt.show()
     
@@ -461,7 +548,7 @@ Top 3 Features:
                 df = self.read_s3_table(s3_path)
                 print(f"  Data shape: {df.shape}")
                 print(f"  Columns: {', '.join(df.columns[:10])}" + 
-                     (f"... (+{len(df.columns)-10} more)" if len(df.columns) > 10 else ""))
+                    (f"... (+{len(df.columns)-10} more)" if len(df.columns) > 10 else ""))
                 
                 # Split by date
                 print(f"\n📅 Splitting data by date (cutoff: {self.train_cutoff_date})...")
@@ -473,9 +560,9 @@ Top 3 Features:
                 X_train, y_train, feature_names, categorical_features = self.prepare_features(train_df)
                 X_test, y_test, _, _ = self.prepare_features(test_df)
                 
-                # Train model and get metrics
+                # Train model and get metrics (now also returns prediction probabilities)
                 print(f"\n🚀 Training LightGBM classifier...")
-                model, metrics, additional_info = self.train_lgbm_model(
+                model, metrics, additional_info, y_train_pred_proba, y_test_pred_proba = self.train_lgbm_model(
                     X_train, y_train, X_test, y_test, feature_names, categorical_features
                 )
                 print(f"  Training completed at iteration {additional_info['best_iteration']}")
@@ -487,9 +574,57 @@ Top 3 Features:
                 # Get top K features
                 top_k_features = dict(list(feature_importance.items())[:self.top_k_features])
                 
+                # Calculate additional metrics for storage
+                n_classes = additional_info['n_classes']
+                if n_classes == 2:
+                    try:
+                        # Calculate KS statistics
+                        from scipy import stats
+                        
+                        # KS for train
+                        preds_class0_train = y_train_pred_proba[y_train == 0][:, 1]
+                        preds_class1_train = y_train_pred_proba[y_train == 1][:, 1]
+                        train_ks = stats.ks_2samp(preds_class0_train, preds_class1_train).statistic
+                        
+                        # KS for test
+                        preds_class0_test = y_test_pred_proba[y_test == 0][:, 1]
+                        preds_class1_test = y_test_pred_proba[y_test == 1][:, 1]
+                        test_ks = stats.ks_2samp(preds_class0_test, preds_class1_test).statistic
+                        
+                        # ROC AUC for train
+                        from sklearn.metrics import roc_auc_score
+                        train_roc_auc = roc_auc_score(y_train, y_train_pred_proba[:, 1])
+                        
+                        additional_metrics = {
+                            'train_roc_auc': train_roc_auc,
+                            'test_roc_auc': metrics['roc_auc'],
+                            'train_ks': train_ks,
+                            'test_ks': test_ks,
+                            'overfitting_roc_auc': abs(train_roc_auc - metrics['roc_auc']),
+                            'overfitting_ks': abs(train_ks - test_ks)
+                        }
+                    except Exception as e:
+                        print(f"  Warning: Could not calculate KS statistics: {e}")
+                        additional_metrics = {}
+                else:
+                    # Multi-class case
+                    try:
+                        from sklearn.metrics import roc_auc_score
+                        train_roc_auc = roc_auc_score(y_train, y_train_pred_proba, 
+                                                    multi_class='ovr', average='weighted')
+                        additional_metrics = {
+                            'train_roc_auc': train_roc_auc,
+                            'test_roc_auc': metrics.get('roc_auc'),
+                            'overfitting_roc_auc': abs(train_roc_auc - metrics.get('roc_auc', 0)) if metrics.get('roc_auc') else None
+                        }
+                    except Exception as e:
+                        print(f"  Warning: Could not calculate multi-class ROC AUC: {e}")
+                        additional_metrics = {}
+                
                 # Store results
                 all_results[table_name] = {
                     'metrics': metrics,
+                    'additional_metrics': additional_metrics,
                     'feature_importance': feature_importance,
                     'top_k_features': list(top_k_features.keys()),
                     'top_k_importance_scores': top_k_features,
@@ -503,11 +638,30 @@ Top 3 Features:
                 print(f"\n✅ Results for {table_name}:")
                 print(f"  Accuracy: {metrics['accuracy']:.4f}")
                 print(f"  F1 Score: {metrics['f1']:.4f}")
-                print(f"  ROC AUC: {metrics['roc_auc']:.4f}" if metrics['roc_auc'] else "  ROC AUC: N/A")
+                print(f"  Test ROC AUC: {metrics['roc_auc']:.4f}" if metrics['roc_auc'] else "  ROC AUC: N/A")
+                
+                if additional_metrics:
+                    if 'train_roc_auc' in additional_metrics:
+                        print(f"  Train ROC AUC: {additional_metrics['train_roc_auc']:.4f}")
+                    if 'test_ks' in additional_metrics:
+                        print(f"  Test KS: {additional_metrics['test_ks']:.4f}")
+                    if 'overfitting_roc_auc' in additional_metrics and additional_metrics['overfitting_roc_auc'] is not None:
+                        overfitting_level = "Low" if additional_metrics['overfitting_roc_auc'] < 0.05 else "Moderate" if additional_metrics['overfitting_roc_auc'] < 0.1 else "High"
+                        print(f"  Overfitting: {overfitting_level} (ROC AUC diff: {additional_metrics['overfitting_roc_auc']:.4f})")
+                
                 print(f"  Top 3 Features: {', '.join(list(top_k_features.keys())[:3])}")
                 
-                # Create diagnostic plots
-                self.plot_diagnostics(table_name, metrics, feature_importance, additional_info)
+                # Create diagnostic plots with new parameters
+                self.plot_diagnostics(
+                    table_name, 
+                    metrics, 
+                    feature_importance, 
+                    additional_info,
+                    y_train,
+                    y_test,
+                    y_train_pred_proba,
+                    y_test_pred_proba
+                )
                 
             except Exception as e:
                 print(f"❌ Error processing {s3_path}: {str(e)}")
