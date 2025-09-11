@@ -359,14 +359,14 @@ class ModelPipeline:
         y_test_pred_proba : np.ndarray
             Test predictions probabilities
         """
-        fig = plt.figure(figsize=(18, 8))
+        fig = plt.figure(figsize=(20, 10))
         
-        # Create grid - 2x2 layout
-        gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3, 
-                            height_ratios=[1.2, 0.8])
+        # Create grid - custom layout
+        gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.25, 
+                            width_ratios=[2, 1, 1.5])
         
-        # Plot 1: Top K Feature Importance (larger plot)
-        ax1 = fig.add_subplot(gs[0, :])
+        # Plot 1: Top K Feature Importance (left side, spanning 2 rows)
+        ax1 = fig.add_subplot(gs[:, 0])
         top_features = dict(list(feature_importance.items())[:self.top_k_features])
         
         features = list(top_features.keys())
@@ -389,10 +389,53 @@ class ModelPipeline:
             ax1.text(width + 0.005, bar.get_y() + bar.get_height()/2.,
                     f'{value:.3f}', ha='left', va='center', fontsize=9, fontweight='bold')
         
-        # Plot 2: Class Distribution
-        ax2 = fig.add_subplot(gs[1, 0])
+        # Plot 2: Model Information (right of feature importance, top)
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.axis('off')
+        
+        # Get class distribution info
         train_dist = additional_info['class_distribution_train']
         test_dist = additional_info['class_distribution_test']
+        train_total = sum(train_dist.values())
+        test_total = sum(test_dist.values())
+        
+        # Get top 3 features for display
+        top_3_features = features[:3] if len(features) >= 3 else features
+        
+        info_text = f"""MODEL INFORMATION
+    {'='*25}
+
+    Dataset: {table_name}
+
+    SAMPLES:
+    Train: {train_total:,}
+    Test:  {test_total:,}
+    Total: {train_total + test_total:,}
+
+    FEATURES:
+    Total: {len(additional_info['feature_names'])}
+    Categorical: {len(additional_info['categorical_features'])}
+    Numeric: {len(additional_info['feature_names']) - len(additional_info['categorical_features'])}
+
+    MODEL:
+    Classes: {additional_info['n_classes']}
+    Best Iter: {additional_info['best_iteration']}
+    Algorithm: LightGBM
+
+    TOP 3 FEATURES:
+    """
+        
+        for i, feat in enumerate(top_3_features, 1):
+            # Truncate long feature names
+            feat_display = feat[:20] + '...' if len(feat) > 23 else feat
+            info_text += f"  {i}. {feat_display}\n"
+        
+        ax2.text(0.05, 0.95, info_text, transform=ax2.transAxes, 
+                fontsize=10, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.2))
+        
+        # Plot 3: Class Distribution (bottom middle)
+        ax3 = fig.add_subplot(gs[1, 1])
         
         classes = sorted(set(list(train_dist.keys()) + list(test_dist.keys())))
         train_counts = [train_dist.get(c, 0) for c in classes]
@@ -401,34 +444,35 @@ class ModelPipeline:
         x = np.arange(len(classes))
         width = 0.35
         
-        bars1 = ax2.bar(x - width/2, train_counts, width, label='Train', 
+        bars1 = ax3.bar(x - width/2, train_counts, width, label='Train', 
                     color='skyblue', edgecolor='navy', alpha=0.8)
-        bars2 = ax2.bar(x + width/2, test_counts, width, label='Test', 
+        bars2 = ax3.bar(x + width/2, test_counts, width, label='Test', 
                     color='lightcoral', edgecolor='darkred', alpha=0.8)
         
         # Add value labels on bars
         for bars in [bars1, bars2]:
             for bar in bars:
                 height = bar.get_height()
-                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                ax3.text(bar.get_x() + bar.get_width()/2., height,
                         f'{int(height):,}', ha='center', va='bottom', fontsize=9)
         
-        ax2.set_xlabel('Class', fontsize=11)
-        ax2.set_ylabel('Count', fontsize=11)
-        ax2.set_title(f'Class Distribution - {table_name}', fontsize=12, fontweight='bold')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(classes)
-        ax2.legend(loc='upper right')
-        ax2.grid(axis='y', alpha=0.3, linestyle='--')
+        ax3.set_xlabel('Class', fontsize=11)
+        ax3.set_ylabel('Count', fontsize=11)
+        ax3.set_title('Class Distribution', fontsize=12, fontweight='bold')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(classes)
+        ax3.legend(loc='upper right', fontsize=9)
+        ax3.grid(axis='y', alpha=0.3, linestyle='--')
         
-        # Plot 3: ROC AUC & KS Metrics
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.axis('off')
+        # Plot 4: ROC AUC & KS Metrics (right side, spanning both rows)
+        ax4 = fig.add_subplot(gs[:, 2])
+        ax4.axis('off')
         
         # Calculate metrics for binary classification
-        metrics_text = f"""Performance Metrics - {table_name}
-        
-    {'='*40}"""
+        metrics_text = f"""PERFORMANCE METRICS
+    {'='*30}
+
+    """
         
         n_classes = additional_info['n_classes']
         
@@ -443,21 +487,38 @@ class ModelPipeline:
                 train_ks = calculate_ks_statistic(y_train, y_train_pred_proba[:, 1])
                 test_ks = calculate_ks_statistic(y_test, y_test_pred_proba[:, 1])
                 
-                metrics_text += f"""
-    TRAIN METRICS:
-    ROC AUC: {train_roc_auc:.4f}
+                # Determine overfitting status
+                roc_diff = abs(train_roc_auc - test_roc_auc)
+                ks_diff = abs(train_ks - test_ks)
+                
+                if roc_diff < 0.03:
+                    overfit_status = "✅ Low"
+                    overfit_color = "green"
+                elif roc_diff < 0.07:
+                    overfit_status = "⚠️  Moderate"
+                    overfit_color = "orange"
+                else:
+                    overfit_status = "❌ High"
+                    overfit_color = "red"
+                
+                metrics_text += f"""TRAIN METRICS:
+    ROC AUC:      {train_roc_auc:.4f}
     KS Statistic: {train_ks:.4f}
     
     TEST METRICS:
-    ROC AUC: {test_roc_auc:.4f}
+    ROC AUC:      {test_roc_auc:.4f}
     KS Statistic: {test_ks:.4f}
     
     OVERFITTING CHECK:
-    ROC AUC Diff: {abs(train_roc_auc - test_roc_auc):.4f}
-    KS Diff: {abs(train_ks - test_ks):.4f}"""
+    ROC AUC Diff: {roc_diff:.4f}
+    KS Diff:      {ks_diff:.4f}
+    Status: {overfit_status}
+    
+    {'='*30}
+    """
                 
             except Exception as e:
-                metrics_text += f"\nError calculating metrics: {str(e)}"
+                metrics_text += f"Error calculating metrics:\n{str(e)[:50]}\n\n"
         else:
             # Multi-class classification
             try:
@@ -466,54 +527,65 @@ class ModelPipeline:
                 test_roc_auc = roc_auc_score(y_test, y_test_pred_proba, 
                                             multi_class='ovr', average='weighted')
                 
-                metrics_text += f"""
-    TRAIN METRICS:
+                roc_diff = abs(train_roc_auc - test_roc_auc)
+                
+                if roc_diff < 0.03:
+                    overfit_status = "✅ Low"
+                elif roc_diff < 0.07:
+                    overfit_status = "⚠️  Moderate"
+                else:
+                    overfit_status = "❌ High"
+                
+                metrics_text += f"""TRAIN METRICS:
     ROC AUC (weighted): {train_roc_auc:.4f}
     
     TEST METRICS:
     ROC AUC (weighted): {test_roc_auc:.4f}
     
     OVERFITTING CHECK:
-    ROC AUC Diff: {abs(train_roc_auc - test_roc_auc):.4f}
+    ROC AUC Diff: {roc_diff:.4f}
+    Status: {overfit_status}
     
-    Note: KS statistic not applicable for 
-    multi-class classification"""
+    Note: KS statistic N/A for
+    multi-class classification
+
+    {'='*30}
+    """
                 
             except Exception as e:
-                metrics_text += f"\nError calculating metrics: {str(e)}"
+                metrics_text += f"Error calculating metrics:\n{str(e)[:50]}\n\n"
         
         metrics_text += f"""
-    {'='*40}
-
-    BASIC METRICS:
-    Accuracy: {metrics['accuracy']:.4f}
-    F1 Score: {metrics['f1']:.4f}
+    BASIC METRICS (Test):
+    Accuracy:  {metrics['accuracy']:.4f}
+    F1 Score:  {metrics['f1']:.4f}
     Precision: {metrics['precision']:.4f}
-    Recall: {metrics['recall']:.4f}"""
+    Recall:    {metrics['recall']:.4f}
+
+    {'='*30}
+
+    {'='*30}
+
+    CONFUSION MATRIX:
+    """
         
-        ax3.text(0.05, 0.95, metrics_text, transform=ax3.transAxes, 
-                fontsize=10, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.2))
+        # Add confusion matrix as text
+        cm = np.array(additional_info['confusion_matrix'])
+        if cm.shape[0] == 2:
+            metrics_text += f"""
+        Pred 0  Pred 1
+    Act 0  {cm[0,0]:5d}  {cm[0,1]:5d}
+    Act 1  {cm[1,0]:5d}  {cm[1,1]:5d}
+    """
+        else:
+            metrics_text += f"\n{cm.shape[0]} classes (see full matrix in logs)"
         
-        # Add Model Information in the bottom right corner
-        info_text = f"""Model Information
-        
-    Dataset: {table_name}
-    Number of Classes: {additional_info['n_classes']}
-    Best Iteration: {additional_info['best_iteration']}
-    Train Samples: {sum(train_counts):,}
-    Test Samples: {sum(test_counts):,}
-    Total Features: {len(additional_info['feature_names'])}
-    Categorical Features: {len(additional_info['categorical_features'])}"""
-        
-        # Create text box for model info
-        props = dict(boxstyle='round', facecolor='wheat', alpha=0.3)
-        fig.text(0.98, 0.02, info_text, transform=fig.transFigure, 
-                fontsize=9, verticalalignment='bottom', horizontalalignment='right',
-                fontfamily='monospace', bbox=props)
+        ax4.text(0.05, 0.98, metrics_text, transform=ax4.transAxes, 
+                fontsize=9.5, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.2))
         
         plt.suptitle(f'Model Diagnostic Report - {table_name}', 
-                    fontsize=14, fontweight='bold', y=0.98)
+                    fontsize=15, fontweight='bold', y=0.98)
         plt.tight_layout()
         plt.show()
     
